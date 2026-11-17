@@ -239,10 +239,11 @@ BUS_DWELL = 20   # 정류장 정차 시간 (초)
 # ──────────────────────────────────────────────────────────────
 # 긴급차량 (v4): 소방차·구급차
 #   사이렌 켬 (vClass emergency): 버스전용차로 주행 가능, 신호 무시(적색은 약 22 km/h 이하로, 다가오는 교차
-#     차량·횡단보도 보행자에는 양보), 속도 제한 무시(speedFactor). 다른 차가 비켜 주기·긴급차량 우선신호·
-#     횡단보도 서행은 EMERGENCY_ASSIST (env/daehakro_emergency.py, TraCI).
+#     차량·횡단보도 보행자에는 양보), 속도 제한 무시(speedFactor). 다른 차가 비켜 주기, 긴급차의
+#     횡단보도·교차로 안전 운전은 EMERGENCY_ASSIST (env/daehakro_emergency.py, TraCI).
+#     신호등은 긴급차 때문에 바뀌지 않는다 (우선신호 끔).
 #   사이렌 끔: 일반 차와 같은 규칙 (소방차 = truck, 구급차 = passenger → 버스전용차로·신호 위반 없음, 비켜 주지 않음)
-#   SIREN_ON = False 로 바꾸면 1500초 출동 차량도 사이렌 없이 일반 차처럼 달린다.
+#   SIREN_ON = False 로 바꾸면 출동 차량도 사이렌 없이 일반 차처럼 달린다.
 # ──────────────────────────────────────────────────────────────
 SIREN_ON = True
 EMERGENCY_TYPES = {
@@ -262,23 +263,36 @@ SIREN = {
 EMERGENCY_ASSIST = {
     "make_way_dist": 80.0,       # 긴급차 앞 이 거리(m) 안, 같은 차로의 차가 옆 차로로 비킴
     "return_after": 4.0,         # 긴급차가 지나가고 이 시간(초) 뒤 버스차로에서 원래 차로로 돌아감
-    "ped_brake": 3.0,            # 횡단보도에 사람이 있으면 이 감속도(m/s²)로 횡단보도 앞에서 설 수 있게 미리 줄임
-    "ped_creep_speed": 2.0,      # 사람이 있는 횡단보도를 지날 때 속도 (m/s, 약 7 km/h)
+    # 긴급차 안전 운전 (긴급차가 사고를 내지 않게): 사람이 있거나 보행 신호가 켜진 횡단보도는 지나가지 않고
+    #   그 앞에 완전히 선다. 양보하며 들어가는 교차로(적색·황색, 소방서 진출로)는 비어 있을 때만 들어간다.
+    "ped_brake": 3.0,            # 횡단보도·정지선 앞에 설 수 있게 미리 줄이는 감속도 (m/s²)
+    "ped_green_margin": 3.0,     # 횡단보도를 다 빠져나간 뒤 이 시간(초) 안에 보행 신호가 켜질 것 같으면 정지선에서 기다림
     # 긴급차량 우선신호 (인천·경기 등 여러 도시에서 실제로 운영): 긴급차가 다가오는 신호등을 미리 초록불로.
-    #   False 로 두면 신호는 그대로이고 긴급차가 적신호를 무시하고 지나감 (앞에 대기 줄이 있으면 기다림)
-    "priority_signal": True,
+    #   False (기본): 신호등은 그대로. 긴급차는 적신호를 지나가되, 교차로가 비어 있고 들어올 차가 없을 때만
+    #   들어간다 (소방서 앞 출동 신호도 쓰지 않음 → 소방차는 본선 차가 끊길 때 나온다)
+    "priority_signal": False,
     "priority_dist": 150.0,      # 신호등까지 이 거리(m) 안에 들어오면 우선신호 시작 (황색 3초 + 전적색 2초 뒤 초록)
     "priority_max_hold": 45.0,   # 우선신호를 이보다 오래 붙잡지 않음 (초)
     # 꼬리물기 방지 (긴급차와 상관없이 늘): 직진·우회전이 갈라지는 차로에서 옆 갈래 차가 교차로 입구를 막고
     #   서 있으면 정지선을 넘지 않음 (SUMO 는 같은 갈래 앞차만 봄 → 정지선을 살짝 넘어 갇혔다가 늦게 빠져나감)
     "box_guard": True,
 }
-# 1500초 출동 (사이렌 켬): (차량 id, 종류, 출발, 도착, 출발 시각)
+# 출동 (사이렌 켬): EMERGENCY_PERIOD 초마다 한 대씩, 아래 EMERGENCY_ROUTES 의 차가 번갈아 나온다.
 #   FS = 소방서, S = 이화사거리 남쪽 갈래, NW/NE = 로터리 혜화로·창경궁로 북동쪽
-EMERGENCY_DISPATCH = [
-    ("fire_1500", "fire", "FS", "NW", 1500.0),
-    ("ambulance_1500", "ambulance", "S", "NE", 1500.0),
-]
+#   (예전: 1500 초에 소방차·구급차 한 대씩 = 한 시간에 두 대 → AV 가 사이렌 차를 거의 만나지 못했다.)
+#   값을 바꾸면 도로를 다시 만들어야 한다:  python -m env.daehakro_builder
+EMERGENCY_PERIOD = 90.0      # s. 출동 간격. 0 이하면 출동 없음
+EMERGENCY_FIRST = 90.0       # s. 첫 출동 시각
+EMERGENCY_UNTIL = 3600.0     # s. 이 시각까지 (SIM["end"] 와 같게)
+EMERGENCY_ROUTES = [("fire", "FS", "NW"), ("ambulance", "S", "NE")]      # (종류, 출발, 도착)
+# (차량 id, 종류, 출발, 도착, 출발 시각)
+EMERGENCY_DISPATCH = []
+if EMERGENCY_PERIOD > 0:
+    _t, _i = EMERGENCY_FIRST, 0
+    while _t < EMERGENCY_UNTIL:
+        _kind, _o, _d = EMERGENCY_ROUTES[_i % len(EMERGENCY_ROUTES)]
+        EMERGENCY_DISPATCH.append((f"{_kind}_{int(round(_t)):04d}", _kind, _o, _d, float(_t)))
+        _t, _i = _t + EMERGENCY_PERIOD, _i + 1
 # 사이렌 없이 다니는 소방차·구급차 (일반 차량과 같은 규칙, 낮은 빈도): (이름, 종류, 출발, 도착, 대/시)
 EMERGENCY_NORMAL = [
     ("amb_nb", "ambulance", "S", "NE", 2), ("amb_sb", "ambulance", "NE", "S", 2),

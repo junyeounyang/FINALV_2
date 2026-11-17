@@ -25,10 +25,18 @@ SUMO 파일만으로(이 보조 없이도) 되는 것 — daehakro.rou.xml 의 f
      원래 종류·색으로 되돌린다. 비킬 틈이 없어 서 있는 차는 옆 차로 뒤차를 세워 틈을 만들어 주고,
      정류장에 선 버스 뒤에 긴급차가 서면 옆 차로 뒤차를 세워 긴급차가 끼어들 틈을 만든다.
      긴급차 옆 차로 앞쪽에 서 있던 차(정류장 버스 등)는 긴급차가 지나갈 때까지 출발하지 않는다.
-  2) 보행자 보호: 횡단보도에 사람이 있거나 막 건너려는 사람이 있으면, 횡단보도 앞에서
-     설 수 있는 속도까지 미리 줄이고 천천히(약 7 km/h) 지나간다. 70 km/h 로 달리다
-     사람을 발견하면 SUMO 기본 제동으로는 횡단보도 앞에서 못 설 수 있기 때문.
-  3) 긴급차량 우선신호(선택, 기본 켬): 실제 인천·경기 등 여러 도시에서 쓰는 방식처럼 긴급차가
+  2) 긴급차 안전 운전 (긴급차가 사고를 내지 않게. 우선신호 없이 적색을 지나갈 때 특히 중요)
+     - 보행자: 횡단보도에 사람이 있거나 막 건너려는 사람이 있으면 횡단보도 앞에 완전히 선다 (사람 사이를
+       서행으로 지나가지 않음). 보행 신호가 켜져 있는 횡단보도는 사람이 안 보여도 지나가지 않는다.
+       신호 시간표를 보고, 횡단보도를 다 빠져나가기 전에 보행 신호가 켜질 것 같으면 교차로 정지선 앞에서
+       미리 선다 (교차로 안에서 달리는 중에 보행 신호가 켜져 사람이 건너기 시작하는 일을 막음).
+     - 교차로 진입: 초록불이 아닌데 들어가는 곳에서는 정지선 앞에서 먼저 확인하고, 안 되면 거기서 기다린다.
+       · 적색·황색 신호: 내 길을 가로지르는 교차로 안 차로가 비어 있고, 그쪽에서 들어올 차(SUMO 가 '곧 들어올
+         차'로 잡은 차, 내가 다 지나가기 전에 초록불을 받을 차)가 없고, 나갈 차로에 자리가 있을 때만 들어간다.
+       · 신호 없는 진출로(소방서)·양보 진입: 다가오는 차에 대한 양보는 SUMO 기본 판단대로 하되, 가로지르는
+         차로에 서행·정지 차가 걸쳐 있거나 나갈 자리가 없으면 들어가지 않는다 (SUMO 는 교차로 안에서 서행하는
+         차의 꽁무니를 놓쳐 부딪치는 일이 있었다).
+  3) 긴급차량 우선신호(선택, 기본 끔): 실제 인천·경기 등 여러 도시에서 쓰는 방식처럼 긴급차가
      다가오는 신호등을 미리 긴급차 방향 초록불로 바꾼다 (황색 3초 + 전적색 2초를 거쳐 안전하게).
      소방서에서 나올 때는 O 교차로 본선을 빨간불로 세운다 (소방서 앞 출동 신호, 옆길 O 신호 단계).
      앞에 신호 대기 줄이 있으면 SUMO 차는 옆으로 비킬 공간이 없어 긴급차가 줄 뒤에 갇히는데,
@@ -85,19 +93,25 @@ class EmergencyAssist:
         self.pre_dist = a["priority_dist"]
         self.max_hold = a["priority_max_hold"]
         self.ped_brake = a["ped_brake"]
-        self.creep = a["ped_creep_speed"]
+        self.ped_margin = a.get("ped_green_margin", 3.0)
+        self.native_foes = hasattr(traci.vehicle, "getJunctionFoes")   # SUMO 1.17 이상 (없으면 정지선 맨 앞 차만 봄)
         self.exit_signal = {"FS_in": cfg.FIRE_STATION.get("exit_signal")}   # 소방서 진출로 → 출동 신호등
         self.exiting = set()      # 소방서에서 막 나오는 긴급차
         self.helped = {}          # 정차 차량 뒤에 갇힌 긴급차 → 마지막으로 옆 차로를 비워 달라고 한 시각
         self.held = {}            # 긴급차가 지나갈 때까지 출발하지 않게 붙잡아 둔 차 → 마지막 확인 시각
         self.evs = set()          # 지금 달리는 사이렌 차
         self.yielding = {}        # 비켜 준 차 → 상태
-        self.capped = set()       # 보행자 때문에 속도를 줄인 긴급차
+        self.capped = set()       # 횡단보도·교차로 앞에서 속도를 줄이거나 세운 긴급차
+        self.hold = {}            # 정지선 앞에 세운 긴급차 → 그 교차로 (조건이 풀릴 때까지 계속 세움)
+        self.why = {}             # 긴급차 → 지금 세운 이유 (확인용)
+        self.junc = {}            # 교차로 안 차로 → 그 길을 가로지르는 차로들 (처음 쓸 때 만듦)
+        self.lane_len = {}        # 차로 길이 (처음 쓸 때 읽음)
         self.bus_lane_entries = set()
         self.pre = {}             # 우선신호 중인 신호등 → 상태
         self.cool = {}            # 오래 붙잡았던 신호등 → 다시 우선신호를 줄 수 있는 시각 (교차 방향도 한 번은 초록)
         self.tl = None            # 신호등 시간표 (처음 step 때 읽음)
-        self.stats = {"make_way": 0, "into_bus_lane": 0, "priority_signal": 0, "ped_slow": 0, "box_hold": 0}
+        self.stats = {"make_way": 0, "into_bus_lane": 0, "priority_signal": 0, "ped_stop": 0, "entry_hold": 0,
+                      "box_hold": 0}
         self._load_crossings(net_file or _default_net())
 
     # ── 네트워크에서 횡단보도 읽기 ──
@@ -105,6 +119,7 @@ class EmergencyAssist:
         root = ET.parse(net_file).getroot()
         self.cross = {}                       # 횡단보도 → 정보
         self.cross_at = {}                    # 노드 → [횡단보도]
+        self.via_src = {}                     # 교차로 안 차로 → (들어오는 차로, 신호등, 신호 번호)
         to_node = {}
         for e in root.iter("edge"):
             if e.get("function") == "crossing":
@@ -120,6 +135,9 @@ class EmergencyAssist:
                 to_node[e.get("id")] = e.get("to")
         for c in root.iter("connection"):
             f, t = c.get("from", ""), c.get("to", "")
+            if c.get("via"):
+                tl = c.get("tl")
+                self.via_src[c.get("via")] = (f"{f}_{c.get('fromLane')}", tl, int(c.get("linkIndex")) if tl is not None else None)
             if t in self.cross:
                 self.cross[t]["wa"].add(f)
                 if c.get("tl") is not None:
@@ -143,16 +161,18 @@ class EmergencyAssist:
         for v in traci.simulation.getArrivedIDList():
             self.evs.discard(v)
             self.capped.discard(v)
+            self.hold.pop(v, None)
+            self.why.pop(v, None)
             self.yielding.pop(v, None)
         if not self.evs and not self.yielding and not self.pre and not self.held:
             return
         live = set(traci.vehicle.getIDList())
         self.evs &= live
-        for ev in self.evs:
+        for ev in sorted(self.evs):                    # 정렬: 실행할 때마다 같은 순서 (같은 시드 → 같은 결과)
             chain = self._make_way(ev, t)
             self._help_change(ev, t)
             self._hold_stoppers(ev, t, chain)
-            self._pedestrians(ev)
+            self._guard(ev, t)
         if self.priority:
             self._signals(t)
         self._restore(t, live)
@@ -298,7 +318,8 @@ class EmergencyAssist:
 
     def _help_change(self, ev, t):
         """정류장에 선 버스 등 움직이지 않는 차 뒤에 긴급차가 서 버렸으면, 옆 차로 뒤쪽 차를 세워
-        끼어들 틈을 만들어 준다 (옆 차로 차들도 긴급차에 양보)."""
+        끼어들 틈을 만들어 준다 (옆 차로 차들도 긴급차에 양보). 끼어드는 것은 뒤차가 설 수 있게 된 다음에:
+        빠르게 오는 차 바로 앞으로 끼어들면 그 차가 급제동해도 긴급차를 들이받는다."""
         if traci.vehicle.getSpeed(ev) > 2.0 or t - self.helped.get(ev, -1e9) < 3.0:
             return
         ln = traci.vehicle.getLaneID(ev)
@@ -322,11 +343,16 @@ class EmergencyAssist:
             ahead = traci.vehicle.getNeighbors(ev, side | 2)
             if min((g for _, g in ahead), default=1e9) < 1.0:
                 continue                                    # 옆 차로 바로 앞도 막힘
+            ready = True                                    # 옆 차로 뒤차가 모두 편하게 설 수 있을 때만 끼어든다
             for f, g in traci.vehicle.getNeighbors(ev, side):
+                vf = traci.vehicle.getSpeed(f)
+                if g < vf * vf / (2 * 3.0) + 2.0:
+                    ready = False                           # 그 차가 설 거리가 모자람 → 이번에는 끼어들지 않는다
                 if g < 25.0 and f not in self.evs and not f.startswith(self.skip):
                     traci.vehicle.slowDown(f, 0.0, 2.0)
-            traci.vehicle.changeLane(ev, j, 4.0)
-            self.helped[ev] = t
+            if ready:
+                traci.vehicle.changeLane(ev, j, 4.0)
+            self.helped[ev] = t if ready else t - 2.0       # 못 끼어들었으면 1초 뒤 다시 확인
             return
 
     @staticmethod
@@ -349,64 +375,256 @@ class EmergencyAssist:
                 return False
         return True
 
-    # ── 2) 보행자 보호 ──
-    def _crossings_ahead(self, ev):
-        route = traci.vehicle.getRoute(ev)
-        ri = traci.vehicle.getRouteIndex(ev)
-        ups = route[max(0, ri):ri + 3]
-        out = []
-        for i, e in enumerate(ups):
-            node = self.to_node.get(e)
-            nxt = ups[i + 1] if i + 1 < len(ups) else None
-            for cid in self.cross_at.get(node, ()):
-                ce = self.cross[cid]["edges"]
-                if e in ce or (nxt is not None and nxt in ce):
-                    out.append(cid)
-        return out
+    # ── 2) 긴급차 안전 운전: 보행자 보호 · 교차로 진입 ──
+    def _green_in(self, tls, idx, t):
+        """신호등 tls 의 idx 번 신호가 초록이 될 때까지 남은 시간(초). 지금 초록이거나 시간표를 모르면 0."""
+        st = traci.trafficlight.getRedYellowGreenState(tls)
+        if idx >= len(st) or st[idx] in "Gg":
+            return 0.0
+        P = self.pre.get(tls)
+        if P is not None:                                 # 우선신호 중: 예정된 신호 순서에서 찾는다
+            start = t
+            for state, until in P["plan"]:
+                if state[idx] in "Gg":
+                    return max(0.0, start - t)
+                start = until
+            if P["mode"] != "out":
+                return INF                                # 긴급차가 지나갈 때까지 지금 신호 그대로
+        T = self.tl.get(tls)
+        if T is None:
+            return 0.0
+        n = len(T["phases"])
+        e = (t - T["anchor"]) % T["C"]
+        k = next((i for i in range(n) if e < T["cum"][i + 1]), n - 1)
+        wait = T["cum"][k + 1] - e
+        for j in range(1, n + 1):
+            state, dur = T["phases"][(k + j) % n]
+            if idx < len(state) and state[idx] in "Gg":
+                return wait
+            wait += dur
+        return INF
 
-    def _ped_risk(self, cid):
-        """그 횡단보도 위에 사람이 있거나, 끝에서 막 건너려는 사람이 있는지."""
-        if traci.edge.getLastStepPersonIDs(cid):
-            return True
+    @staticmethod
+    def _travel(dist, v, acc=1.5, cruise=6.0):
+        """지금 속도 v 에서 dist(m) 를 가는 데 걸리는 시간 (넉넉하게: 가속 1.5 m/s², 적색 통과 속도 6 m/s 기준)."""
+        top = max(v, cruise)
+        t_acc = (top - v) / acc
+        d_acc = (v + top) / 2 * t_acc
+        if dist <= d_acc:
+            return (math.sqrt(v * v + 2 * acc * max(dist, 0.0)) - v) / acc
+        return t_acc + (dist - d_acc) / top
+
+    def _stop_speed(self, room):
+        """room(m) 안에 설 수 있는 속도: 감속도 ped_brake 로, 한 스텝 늦게 줄이기 시작해도 넘지 않게 (SUMO 는 0.5 초 단위)."""
+        if room <= 0.0:
+            return 0.0
+        b = self.ped_brake * self.dt
+        return min(math.sqrt(b * b + 2 * self.ped_brake * room) - b, room / self.dt)
+
+    def _length(self, lane_id):
+        if lane_id not in self.lane_len:
+            self.lane_len[lane_id] = traci.lane.getLength(lane_id)
+        return self.lane_len[lane_id]
+
+    def _ped_state(self, cid, t, need):
+        """그 횡단보도를 지금부터 need 초 동안 지나가도 되는가 → (단계, 보행 신호가 켜질 때까지 남은 시간).
+        2 = 사람이 건너는 중·막 건너려 함, 또는 보행 신호가 켜져 있음 / 1 = 다 지나가기 전에 보행 신호가 켜짐 / 0 = 됨."""
         c = self.cross[cid]
-        if c["tl"] is not None:
-            st = traci.trafficlight.getRedYellowGreenState(c["tl"])
-            if c["idx"] < len(st) and st[c["idx"]] not in "Gg":
-                return False                              # 보행 신호 빨강 → 새로 건너오지 않음
-        for wa in c["wa"]:
+        g = 0.0 if c["tl"] is None else self._green_in(c["tl"], c["idx"], t)
+        if traci.edge.getLastStepPersonIDs(cid):
+            return 2, g
+        if g > need:
+            return 0, g                                   # 다 지나갈 때까지 보행 신호 빨강 → 새로 건너오지 않음
+        if c.get("timed"):
+            return (2 if g <= 0.0 else 1), g
+        for wa in c["wa"]:                                # 늘 초록이거나 신호 없는 횡단보도 (소방서 진출입로 보도 등)
             for p in traci.edge.getLastStepPersonIDs(wa):
                 if traci.person.getNextEdge(p) == cid:
-                    return True
+                    return 2, g                           # 끝에서 막 건너려는 사람
+        return 0, g
+
+    @staticmethod
+    def _ped_in_path(cid, pos, hx, hy):
+        """차 앞머리 바로 앞 (앞 8 m, 좌우 3 m) 에 그 횡단보도를 건너는 사람이 있는지."""
+        for p in traci.edge.getLastStepPersonIDs(cid):
+            px, py = traci.person.getPosition(p)
+            ahead = (px - pos[0]) * hx + (py - pos[1]) * hy
+            side = (px - pos[0]) * hy - (py - pos[1]) * hx
+            if -1.0 <= ahead <= 8.0 and abs(side) <= 3.0:
+                return True
         return False
 
-    def _pedestrians(self, ev):
+    def _source(self, lane):
+        """교차로 안 차로 lane 으로 들어오는 (바깥 차로, 신호등, 신호 번호, 중간에 거치는 교차로 안 차로들)."""
+        src, tls, idx, mid = lane, None, None, []
+        for _ in range(3):
+            if src not in self.via_src:
+                return None, None, None, mid
+            src, tls, idx = self.via_src[src]
+            if not src.startswith(":"):
+                break
+            mid.append(src)                               # 교차로 안에서 기다렸다 들어오는 차로
+        return src, tls, idx, mid
+
+    def _conflicts(self, via):
+        """교차로 안 차로 via 로 지나갈 때 가로지르거나 합쳐지는 차로들. len: via 길이,
+        inside: [(교차로 안 차로, 그 차로가 나가는 차로)], from: [(그리로 들어오는 차로, 신호등, 신호 번호)],
+        lanes: 그 교차로 안 차로들"""
+        inside, srcs, seen, length, lane = [], {}, set(), 0.0, via
+        own = self._source(via)[0]                        # 내가 들어오는 차로: 같은 차로에서 갈라지는 길은 앞차 문제 (SUMO 가 봄)
+        for _ in range(3):
+            length += traci.lane.getLength(lane)
+            for f in traci.lane.getInternalFoes(lane):
+                edge = f.rsplit("_", 1)[0]
+                if f in seen or "_c" in edge or "_w" in edge:
+                    continue                              # 횡단보도·보행자 대기 공간은 _ped_state 가 본다
+                seen.add(f)
+                out = [lk[0] for lk in traci.lane.getLinks(f) if not lk[0].startswith(":")]
+                src, tls, idx, mid = self._source(f)
+                if src is not None and src == own:
+                    continue
+                inside.append((f, out[0] if out else None))
+                for m in mid:
+                    if m not in seen:
+                        seen.add(m)
+                        inside.append((m, None))
+                if src is not None:
+                    srcs.setdefault(src, (tls, idx))
+            nxt = [lk[0] for lk in traci.lane.getLinks(lane) if lk[0].startswith(":")]
+            if not nxt:
+                break
+            lane = nxt[0]
+        return {"len": length, "inside": inside, "from": [(src, tls, idx) for src, (tls, idx) in srcs.items()],
+                "lanes": {f for f, _ in inside}}
+
+    def _entry(self, ev, t, nl, line, length, v):
+        """초록불이 아닌데 들어가는 교차로에 지금 들어가면 안 되는 이유 (없으면 None). 초록불이면 None: SUMO 기본 판단대로.
+        nl: traci.vehicle.getNextLinks(ev), line: 정지선까지 거리"""
+        if not nl or not nl[0][4] or nl[0][5] in "GM":
+            return None
+        out, via = nl[0][0], nl[0][4]
+        red = nl[0][5] in "ryu"                           # 적색·황색을 지나감 (아니면 신호 없는 진출로·양보 진입)
+        J = self.junc.get(via)
+        if J is None:
+            J = self.junc[via] = self._conflicts(via)
+        ids = traci.lane.getLastStepVehicleIDs(out)
+        if ids:
+            x = ids[0]                                    # 나갈 차로 맨 뒤 차
+            if (traci.vehicle.getLanePosition(x) - traci.vehicle.getLength(x) < length + 2.0
+                    and traci.vehicle.getSpeed(x) < 2.0):
+                return "나갈 자리 없음"
+        # 내 길을 가로지르는 교차로 안 차로: 적색·황색이면 비어 있어야 하고, 양보 진입이면 서행·정지 차가 없어야 한다
+        slow = INF if red else 3.0
+        for f, tail in J["inside"]:
+            for x in traci.lane.getLastStepVehicleIDs(f):
+                if traci.vehicle.getSpeed(x) < slow:
+                    return "교차로 안에 차"
+            if tail is not None:
+                ids = traci.lane.getLastStepVehicleIDs(tail)
+                if (ids and traci.vehicle.getLanePosition(ids[0]) < traci.vehicle.getLength(ids[0]) + 0.5
+                        and traci.vehicle.getSpeed(ids[0]) < slow):
+                    return "교차로를 빠져나가는 차"         # 꽁무니가 아직 교차로 안
+        cross = self._travel(J["len"] + length, min(v, 6.0))   # 교차로를 다 빠져나가는 데 걸리는 시간
+        for src, tls, idx in J["from"]:
+            g = 0.0 if tls is None else self._green_in(tls, idx, t)
+            if g > cross + 2.0 or (g <= 0.0 and (self.native_foes or not red)):
+                continue          # 내가 지나가는 동안 그쪽은 빨강 / 지금 초록인 쪽은 아래에서 (양보 진입은 SUMO 가) 본다
+            ids = traci.lane.getLastStepVehicleIDs(src)
+            if ids and ids[-1] != ev:                     # 정지선에 가장 가까운 차: 내가 다 지나가기 전에 초록불을 받고 들어옴
+                d = self._length(src) - traci.vehicle.getLanePosition(ids[-1])
+                if g + d / max(traci.vehicle.getSpeed(ids[-1]), 4.0) <= cross + 3.0:
+                    return "곧 들어올 차"
+        if red and self.native_foes:
+            # SUMO 가 '그 차로로 곧 들어올 차'로 잡은 차 (짧은 도로 너머 윗길에서 오는 차도 포함). 적색·황색에서는
+            # SUMO 가 가로지르는 차에 양보를 시키지 않는 경우가 있어 직접 확인한다.
+            for f in traci.vehicle.getJunctionFoes(ev, line + J["len"] + 1.0):
+                x, lane = f[0], f[6]
+                if x == ev or lane not in J["lanes"]:
+                    continue
+                if x in self.evs and x in self.hold and x > ev:
+                    continue                              # 서로 기다리는 긴급차 둘: 이름순으로 먼저 감
+                return "들어올 차"
+        return None
+
+    def _guard(self, ev, t):
+        """긴급차 속도 상한: 정지선·횡단보도 앞에서 설 수 있게 줄이고, 조건이 풀리면 원래대로."""
         pos = traci.vehicle.getPosition(ev)
         ang = math.radians(traci.vehicle.getAngle(ev))
         hx, hy = math.sin(ang), math.cos(ang)            # SUMO 각도: 북=0, 시계방향
-        speed = traci.vehicle.getSpeed(ev)
-        reach = speed * speed / (2 * self.ped_brake) + 15.0
-        cap = INF
-        for cid in self._crossings_ahead(ev):
-            c = self.cross[cid]
-            pts = c["shape"]
-            d, q = min((_seg_dist(pos, pts[k], pts[k + 1]) for k in range(len(pts) - 1)), key=lambda x: x[0])
-            if d - c["half"] > reach:
-                continue
-            ahead = (q[0] - pos[0]) * hx + (q[1] - pos[1]) * hy
-            if ahead < -c["half"]:
-                continue                                  # 이미 앞부분이 지나감
-            if not self._ped_risk(cid):
-                continue
-            gap = max(0.0, d - c["half"] - 1.5)          # 횡단보도 앞 1.5 m 에서 설 수 있게
-            cap = min(cap, max(self.creep, math.sqrt(2 * self.ped_brake * gap)))
+        v = traci.vehicle.getSpeed(ev)
+        length = traci.vehicle.getLength(ev)
+        inside = traci.vehicle.getRoadID(ev).startswith(":")
+        nl = () if inside else traci.vehicle.getNextLinks(ev)
+        slow = bool(nl) and nl[0][5] not in "GM"         # 다음 교차로에 초록불 없이 들어감 (적색이면 SUMO 가 6 m/s 이하로 줄임)
+        route, ri = traci.vehicle.getRoute(ev), max(0, traci.vehicle.getRouteIndex(ev))
+        brake = v * v / (2 * self.ped_brake)             # 편하게 서는 데 필요한 거리
+        hard = v * v / (2 * traci.vehicle.getDecel(ev))  # 급제동으로 서는 데 필요한 거리
+        held = self.hold.get(ev)
+        cap, hold, why = INF, None, None
+        for i in range(3):
+            if ri + i >= len(route):
+                break
+            e = route[ri + i]
+            node = self.to_node.get(e)
+            nxt = route[ri + i + 1] if ri + i + 1 < len(route) else None
+            if i == 0:                                    # 정지선까지 거리 (이미 교차로 안이면 None)
+                line = None if inside else self._length(traci.vehicle.getLaneID(ev)) - traci.vehicle.getLanePosition(ev)
+            else:
+                try:
+                    line = traci.vehicle.getDrivingDistance(ev, e, self._length(f"{e}_0"))
+                except traci.TraCIException:
+                    break
+                if line < 0:
+                    break
+            if line is not None and line > brake + 30.0:
+                break                                     # 아직 멀다
+            stops, worst = [], 0
+            for cid in self.cross_at.get(node, ()):
+                c = self.cross[cid]
+                if e not in c["edges"] and (nxt is None or nxt not in c["edges"]):
+                    continue
+                pts = c["shape"]
+                d, q = min((_seg_dist(pos, pts[k], pts[k + 1]) for k in range(len(pts) - 1)), key=lambda x: x[0])
+                if (q[0] - pos[0]) * hx + (q[1] - pos[1]) * hy < -c["half"]:
+                    continue                              # 앞머리가 이미 지나감
+                # 꽁무니까지 다 지나가는 시간 (굽은 길 여유 1.25)
+                clear = self._travel(1.25 * (d + c["half"]) + length, min(v, 6.0) if slow and i == 0 else v)
+                level, g = self._ped_state(cid, t, clear + self.ped_margin)
+                if level == 1 and line is None and g > clear:
+                    level = 0                             # 이미 교차로 안: 보행 신호 전에 빠져나갈 수 있으면 그대로 간다
+                if level:
+                    stops.append((cid, d - c["half"], level))        # 횡단보도 가장자리까지 거리
+                    worst = max(worst, level)
+            jam = None
+            if i == 0 and line is not None and not worst and line <= brake + 15.0:
+                jam = self._entry(ev, t, nl, line, length, v)
+            if line is not None and (worst or jam) and (held == node or v < 0.5 or line >= v * self.dt + hard + 0.5):
+                cap = min(cap, self._stop_speed(line - 1.0))       # 정지선 1 m 앞에 선다 (서 있던 차는 그대로 서 있음)
+                hold, why = node, (jam or ("보행자" if worst == 2 else "곧 보행 신호"))
+                break
+            for cid, edge, level in stops:
+                if line is not None and level == 1:
+                    continue                              # 정지선 앞에 설 수 없고 아직 보행 신호 전 → 그대로 지나감
+                if edge > 0.5:                            # 횡단보도 2 m 앞에 선다 (거기를 조금 넘었어도 횡단보도 밖이면 선다)
+                    cap, why = min(cap, self._stop_speed(edge - 2.0)), "보행자"
+                elif self._ped_in_path(cid, pos, hx, hy):
+                    cap, why = 0.0, "보행자"               # 이미 횡단보도에 걸쳐 있음: 바로 앞에 사람이 있을 때만 선다
+        if hold is None:
+            self.hold.pop(ev, None)
+        else:
+            if held != hold:
+                self.stats["ped_stop" if why in ("보행자", "곧 보행 신호") else "entry_hold"] += 1
+            self.hold[ev] = hold
         if cap < INF:
-            if ev not in self.capped:
-                self.stats["ped_slow"] += 1
+            if hold is None and ev not in self.capped:
+                self.stats["ped_stop"] += 1
             traci.vehicle.setSpeed(ev, cap)
             self.capped.add(ev)
+            self.why[ev] = why
         elif ev in self.capped:
             traci.vehicle.setSpeed(ev, -1)
             self.capped.discard(ev)
+            self.why.pop(ev, None)
 
     # ── 3) 긴급차량 우선신호 ──
     def _snapshot_signals(self, t):
@@ -431,6 +649,10 @@ class EmergencyAssist:
                     veh_cross[i] = self._link_crossings(lk[0][2])
             self.tl[tls] = {"prog": prog, "phases": phases, "cum": cum, "C": cum[-1],
                             "anchor": t - elapsed, "ped": ped, "veh_cross": veh_cross}
+        for c in self.cross.values():                 # 켜졌다 꺼졌다 하는 보행 신호인가 (늘 초록·신호 없음은 False)
+            T = self.tl.get(c["tl"])
+            on = [st[c["idx"]] in "Gg" for st, _ in T["phases"] if c["idx"] < len(st)] if T else []
+            c["timed"] = any(on) and not all(on)
 
     @staticmethod
     def _link_crossings(via):
@@ -521,7 +743,7 @@ class EmergencyAssist:
 
     def _signals(self, t):
         want = {}
-        for ev in self.evs:
+        for ev in sorted(self.evs):
             road = traci.vehicle.getRoadID(ev)
             if road in self.exit_signal and self.exit_signal[road]:
                 self.exiting.add(ev)

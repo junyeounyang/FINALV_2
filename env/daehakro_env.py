@@ -53,6 +53,12 @@
 3) 보상 — 아래 REWARD 표. 수업 코드의 고속도로용 보상(train.py 의 collision_penalty 등)은 쓰지 않는다.
     값을 바꾸려면 아래 표를 고치거나, train.py 의 REWARD_OVERRIDES 에 같은 이름으로 적는다
     (예: red_light_penalty=20.0). 그러면 그 값이 우선한다.
+    PPO 를 처음부터 학습할 때 쓰는 것 두 가지 (둘 다 기본값은 '끔'이라 BC 와 평가에는 영향이 없다):
+    · env.penalty_scale     충돌·신호위반처럼 '일이 생겼을 때 한 번 주는 벌점'에 곱하는 값 (기본 1).
+                            train.py 가 학습 초반에는 작게 두고 1 까지 올린다 (PENALTY_START, PENALTY_RAMP_STEPS).
+                            처음부터 1 이면 PPO 는 "움직이면 손해"를 먼저 배워서 서 있기만 한다.
+    · lane_guide_penalty    차로 안내(관측 [47])가 가리키는 차로에 있지 않은 동안 스텝마다 주는 감점 (기본 0).
+                            경로 이탈 벌점은 한참 뒤에 한 번 오기 때문에, 그것만으로는 차로변경을 배우기 어렵다.
 
 4) 시범 주행 (BC 용) — DaehakroEnv(..., demo=True). collect_demo.py 가 쓴다.
     SUMO 의 안전장치를 켠 채 SUMO 가 AV 의 속도를 정하고, 그 운전을 '정책이 냈어야 할 행동'으로 바꿔 돌려준다.
@@ -190,6 +196,10 @@ DEMO_ACCEL = 2.0            # m/s². 시범 운전자의 가속 세기. AV 의 �
 DEMO_DECEL = 2.5            # m/s². 시범 운전자가 평소에 쓰는 감속 세기. AV 의 한계(4.5)보다 훨씬 부드럽게 둬서
                             #    일찍·완만하게 멈춘다. 늦었을 때는 한계까지 밟는다 (아래 '급하게' 흔들기 참고).
                             #    2.5 보다 낮추지 않는다: 50 km/h 에서 노란불(3초) 안에 멈추지도 지나가지도 못하게 된다
+DEMO_YIELD = True           # 시범 운전자가 사이렌 차에 길을 비켜 준다 (_yield_lane). 시범 관측의 사이렌 값도 그대로 둔다
+YIELD_KEEP = 150.0           # m. 비켜 갈 옆 차로로 내 경로를 이만큼은 더 갈 수 있어야 한다
+YIELD_URGENT = 100.0         # m. 지금 차로가 이 안에서 끊기면 사이렌 차가 뒤에 있어도 차로 안내를 따른다
+YIELD_MAX_DIST = 100.0       # m. 사이렌 차가 이 거리 안에 왔을 때부터 비킨다
 DEMO_SEEK = True            # 틈 맞추기. 차로를 옮겨야 하는데(차로 안내가 켜져 있는데) 옆 차로의 차 때문에 못 옮기고 있으면
                             #    시범 운전자는 그 차보다 조금 느리게 간다. 그러면 그 차가 앞으로 나가고 뒤쪽 틈이 옆으로 온다.
                             #    이게 없으면 옆 차와 같은 속도로 나란히 달리기만 하다가 차로를 못 바꾼 채 로터리에 닿는다
@@ -251,7 +261,13 @@ REWARD = {
     "off_route_penalty": 10.0,        # 경로가 이어지지 않는 차로로 끝까지 가서 경로를 벗어남 (에피소드 종료)
     "lane_change_cost": 0.0,          # 실제로 일어난 차로변경 1회당 (수업 코드와 같은 이유로 처음엔 0)
     "refused_lane_change_cost": 0.0,  # 실행되지 않은 차로변경 명령 1회당 — 없는 차로, 실선, 교차로 안, 안전 검사 탈락 (처음엔 0)
+    "lane_guide_penalty": 0.0,        # 차로 안내가 가리키는 차로에 있지 않은 동안 스텝당, 옮겨야 하는 차로 수만큼
+                                      #   (0 이면 끔. PPO 를 처음부터 학습할 때 train.py 에서 0.05 로 켠다)
 }
+
+# 일이 생겼을 때 주는 벌점 가운데 env.penalty_scale 을 곱하는 것 (도착 보너스와 스텝마다 주는 값에는 곱하지 않는다)
+SCALED_PENALTIES = ("crash_penalty", "crash_pedestrian_penalty", "red_light_penalty", "crosswalk_penalty",
+                    "yield_penalty", "off_route_penalty")
 
 # 수업 클래스가 요구하는 도로·차량 설정. AV 가감속 한계는 ego_type 과 같은 값이다.
 _ROAD = {"length": 1516.0, "num_lanes": 1, "speed_limit": cfg.SPEED["default"]}
@@ -267,13 +283,48 @@ def _near(dist, full):
     return math.sqrt(min(max(dist, 0.0) / full, 1.0))
 
 
+_ROAD_FILES = ("sumocfg", "gui.xml", "net.xml", "rou.xml", "tll.xml", "stops.xml", "deco.xml")   # 도로 파일 (sumocfg 를 맨 마지막에 쓴다)
+_ROAD_CODE = ("daehakro_builder.py", "daehakro_config.py", "daehakro_deco.py")                   # 도로 파일을 만드는 코드
+
+
+def _built_road():
+    """만들어 둔 도로 파일을 그대로 써도 되면 그 sumocfg 경로, 다시 만들어야 하면 None.
+
+    그대로 쓰는 조건 (모두 만족):
+      · 도로 파일이 모두 있다
+      · sumocfg 가 나머지 도로 파일보다 새것이다 — 빌더가 맨 마지막에 쓰는 파일이므로, 끝까지 만들어졌다는 뜻
+      · sumocfg 가 도로를 만드는 코드(_ROAD_CODE)보다 새것이다 — 코드를 고쳤으면 다시 만든다
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    files = [os.path.join(here, "sumo", "daehakro", "daehakro." + ext) for ext in _ROAD_FILES]
+    code = [os.path.join(here, name) for name in _ROAD_CODE]
+    try:
+        done = os.path.getmtime(files[0])
+        if (all(os.path.getmtime(p) <= done for p in files[1:])
+                and all(os.path.getmtime(p) < done for p in code)):
+            return files[0]
+    except OSError:                                  # 없는 파일이 있다
+        pass
+    return None
+
+
 def build(road=None, ego=None, traffic=None, out_dir=None):
     """road_builder.build(ROAD, EGO, TRAFFIC, 폴더) 자리에 그대로 들어간다.
 
-    인자는 쓰지 않는다. 대학로 SUMO 파일을 env/sumo/daehakro/ 에 만들고 sumocfg 경로를 돌려준다.
+    인자는 쓰지 않는다. 대학로 SUMO 파일(env/sumo/daehakro/)의 sumocfg 경로를 돌려준다.
+    도로 파일은 한 번 만들어 두면 다시 만들지 않는다 (_built_road 의 조건 참고).
+    왜: 수집·평가·학습은 SUMO 를 몇 분마다 새로 켜면서 도로 파일을 다시 읽는다. 다른 터미널에서 프로그램을
+        하나 더 시작할 때마다 도로 파일을 다시 쓰면, 쓰는 도중의 파일을 읽은 쪽이 죽을 수 있다.
+        다시 만들지 않으면 여러 프로그램을 언제 시작해도 서로 건드리지 않는다. (빌더는 매번 같은 파일을 만들므로
+        다시 만들든 그대로 쓰든 도로와 교통은 같다.)
+    도로 코드(_ROAD_CODE)를 고치면 다음 실행 때 자동으로 다시 만든다. 그때는 돌고 있는 다른 프로그램이 없을 때 실행한다.
+    강제로 다시 만들려면: python -m env.daehakro_builder
     """
-    sumocfg = daehakro_builder.build(verbose=False)
-    print(f"[daehakro_env] 대학로 도로를 사용합니다: {sumocfg}")
+    sumocfg = _built_road()
+    reused = sumocfg is not None
+    if not reused:
+        sumocfg = daehakro_builder.build(verbose=False)
+    print(f"[daehakro_env] 대학로 도로를 사용합니다: {sumocfg}" + ("  (만들어 둔 파일 그대로)" if reused else "  (새로 만듦)"))
     return sumocfg
 
 
@@ -321,6 +372,8 @@ class DaehakroEnv(SumoHighwayEnv):
 
         # 대학로 보상 (표 + train.py 에서 같은 이름으로 넘어온 값)
         self.drw = {**REWARD, **{k: v for k, v in (reward or {}).items() if k in REWARD}}
+        # 벌점 크기 (SCALED_PENALTIES 에 곱한다). train.py 가 학습 중에 바꾼다. 평가·시범·BC 에서는 1 그대로다
+        self.penalty_scale = 1.0
 
         # 관측: 수업 코드 31차원 + 대학로 18차원
         self.base_obs_dim = self.obs_dim
@@ -988,8 +1041,46 @@ class DaehakroEnv(SumoHighwayEnv):
         """
         if s is None:
             return [1.0, 0.0], False
+        sir = s["siren"]
+        # 사이렌 차가 뒤에 있지만 내가 막고 있지는 않다 → 지나갈 때까지 차로를 바꾸지 않는다 (지금 차로가 곧 끊기면 예외)
+        self._demo_wait = bool(DEMO_YIELD and sir and not sir[1] and s["guide"] and s["reach"] > YIELD_URGENT)
         act, disturbed = self._demo_pedal(s)
-        return [act[0], float(np.sign(s["guide"]))], disturbed     # 차로: 안내 쪽으로 (+1 왼쪽, −1 오른쪽, 0 유지)
+        if self._demo_wait:
+            lane_cmd = 0.0
+        else:
+            lane_cmd = float(np.sign(s["guide"])) or float(self._yield_lane(s))    # 차로 안내가 먼저, 없으면 긴급차 양보
+        self._demo_lane_cmd = lane_cmd
+        return [act[0], lane_cmd], disturbed     # 차로: 안내 쪽으로 (+1 왼쪽, −1 오른쪽, 0 유지)
+
+    def _yield_lane(self, s):
+        """사이렌 차의 차로 앞을 막고 있을 때(관측 [42] = 1) 비켜 줄 옆 차로. Returns: +1 왼쪽, −1 오른쪽, 0 없음.
+
+          · 옆 차로가 차가 다닐 수 있는 차로이고 (보도·버스 전용 차로 제외), 실선이 아니고,
+          · 그 차로로 내 경로를 YIELD_KEEP 이상 더 갈 수 있을 때 (사이렌 차를 보내고 돌아올 거리가 있다)
+          · 오른쪽 먼저. 지금 안전 검사를 통과하는 쪽이 있으면 그쪽.
+        비킨 뒤에는 차로 안내가 원래 차로를 가리키지만, 사이렌 차가 지나갈 때까지는 돌아가지 않는다 (_demo_command).
+        지도(net.xml)와 경로만으로 정한다.
+        """
+        sir = s["siren"]
+        if not DEMO_YIELD or not sir or not sir[1] or sir[0] > YIELD_MAX_DIST or s["inside"] or s["guide"]:
+            return 0
+        lane, pos = s["lane"], s["pos"]
+        edge, idx = lane.rsplit("_", 1)
+        idx = int(idx)
+        lanes = self.map.lanes_of.get(edge, ())
+        cand = []
+        for side, step in ((1, -1), (0, 1)):
+            k = idx + step
+            if not (0 <= k < len(lanes)) or not self.map.change_ok.get(lane, (True, True))[side]:
+                continue
+            if not self.map.car_ok.get(lanes[k], False):
+                continue
+            if self._reach.get(lanes[k], 0.0) - pos >= YIELD_KEEP:
+                cand.append(step)
+        for step in cand:
+            if self._side_clear(step):
+                return step
+        return cand[0] if cand else 0
 
     def _demo_pedal(self, s):
         """_demo_command 의 가감속 부분. Returns: ([가감속, 0], 흔들기인가)."""
@@ -1022,7 +1113,7 @@ class DaehakroEnv(SumoHighwayEnv):
         if ped_ahead:
             # 평소 세기로 설 수 있는 속도까지 줄인다. 이미 그보다 빠르면(늦게 봤으면) 한계까지 밟는다.
             return self._toward(v, self._stop_speed(cw[1] - PED_STOP_GAP, DEMO_DECEL)), False
-        seek = self._seek_speed(s) if DEMO_SEEK else None
+        seek = self._seek_speed(s) if (DEMO_SEEK and not getattr(self, "_demo_wait", False)) else None
         if seek is not None:
             return self._toward(v, seek), False      # 틈 맞추기: 막고 있는 옆 차보다 조금 느리게
         return [1.0, 0.0], False
@@ -1151,7 +1242,8 @@ class DaehakroEnv(SumoHighwayEnv):
                 fixed[self._i_need] = self._stop_need(before, tls_state, cw_wait)
                 # 시범 운전자(SUMO)는 사이렌에 반응하지 않는다. 한 시간에 두 번뿐인 긴급차 장면이 엉뚱한 버릇으로
                 # 배워지지 않도록, 시범용 관측에서는 '사이렌 없음'으로 둔다. (긴급차 양보는 PPO 가 보상으로 배운다.)
-                fixed[self._i_siren], fixed[self._i_siren_lane] = 1.0, 0.0
+                if not DEMO_YIELD:
+                    fixed[self._i_siren], fixed[self._i_siren_lane] = 1.0, 0.0
                 info["demo_obs"] = fixed
                 # 서 있을 이유가 관측에 보이는가 (아래에서 '이유 없이 서 있던 스텝'을 가려낼 때 쓴다)
                 info["demo_reason"] = bool(
@@ -1220,7 +1312,7 @@ class DaehakroEnv(SumoHighwayEnv):
         raw = float(np.clip(acc / self.max_accel if acc >= 0.0 else acc / self.max_decel, -1.0, 1.0))
         if v1 < 0.05:
             raw = min(raw, DEMO_HOLD)                # 멈춰 섰다 / 계속 서 있다 → 브레이크를 확실히
-        return [raw, float(np.sign(before["guide"]))]
+        return [raw, float(getattr(self, "_demo_lane_cmd", np.sign(before["guide"])))]
 
     # ==================================================================
     # 보상
@@ -1228,6 +1320,8 @@ class DaehakroEnv(SumoHighwayEnv):
     def _reward(self, info, after):
         """REWARD 표대로 이번 스텝의 보상을 계산한다. Returns: (보상, {항목: 값})."""
         rw, t = self.drw, {}
+        if self.penalty_scale != 1.0:
+            rw = {**rw, **{k: rw[k] * self.penalty_scale for k in SCALED_PENALTIES}}
         if info["collided"]:
             who = info.get("collision_with") or ""
             on_foot = info.get("collision_type") in ("crossing", "walkingarea", "sharedLane") \
@@ -1253,6 +1347,8 @@ class DaehakroEnv(SumoHighwayEnv):
                     else 0.0)
             if cost:
                 t["lane_change"] = -cost
+            if rw["lane_guide_penalty"] and after["guide"]:
+                t["lane_guide"] = -rw["lane_guide_penalty"] * abs(after["guide"])
             if info["stuck"]:
                 t["stuck"] = -rw["stuck_penalty"]
         if not info["collided"]:
