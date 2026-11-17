@@ -42,6 +42,10 @@ SUMO 파일만으로(이 보조 없이도) 되는 것 — daehakro.rou.xml 의 f
      앞에 신호 대기 줄이 있으면 SUMO 차는 옆으로 비킬 공간이 없어 긴급차가 줄 뒤에 갇히는데,
      우선신호로 줄이 먼저 빠져나가게 한다. 긴급차가 지나가면 원래 신호 시간표의 같은
      시각 위치로 되돌려 연동(녹색 물결)이 깨지지 않게 한다.
+  5) 버스 끼워 주기 (긴급차와 상관없이 늘): 경로대로 가려면 옆 차로로 옮겨야 하는 버스가 차로 끝에 서서
+     기다리고 있으면, 옆 차로에서 뒤따라오던 차가 잠깐 서서 버스를 들여보낸다 (실제 도로에서 버스에 양보하듯).
+     SUMO 운전자는 서서 양보하지 않아, 혜화동로터리 서쪽 우회전 갈림 앞에서 버스가 5분씩 갇혀 로터리가
+     통째로 막히는 일이 있었다. AV 와 긴급차는 세우지 않는다.
   4) 꼬리물기 방지 (긴급차와 상관없이 늘): 한 차로가 직진·우회전처럼 갈라지는 신호 교차로에서, 옆 갈래로
      들어가 교차로 안에 멈춘 차(횡단보도 보행자를 기다리는 우회전 차 등)가 두 길이 갈라지기 전 구간을
      막고 있으면, 뒤차는 정지선을 넘지 않고 기다린다. SUMO 는 같은 갈래의 앞차만 보고 진입을 막으므로
@@ -86,6 +90,11 @@ class EmergencyAssist:
         self.box_guard = a.get("box_guard", True) if box_guard is None else box_guard
         self.box = None           # 갈라지는 차로 → 갈래별 '옆 갈래 차가 막는 구간' (처음 step 때 만듦)
         self.box_held = set()     # 꼬리물기 방지로 정지선 앞에 세운 차
+        self.bus_wait = a.get("bus_merge_wait", 5.0)   # 차로 끝에 선 버스를 이만큼(초) 기다린 뒤 끼워 줌. 0 이하면 끔
+        self.buses = set()        # 지금 달리는 버스
+        self.bus_asked = {}       # 버스 → 마지막으로 끼워 달라고 한 시각
+        self.bus_since = {}       # 버스 → 끼워 달라고 하기 시작한 시각 (40초 넘으면 20초 쉼)
+        self.bus_hold = {}        # 버스를 들여보내려고 정지선에 선 차 → (차로, 풀어 줄 시각)
         self.siren_types = set(siren_types or [f"{k}_siren" for k in cfg.EMERGENCY_TYPES])
         self.make_way_dist = a["make_way_dist"]
         self.return_after = a["return_after"]
@@ -111,7 +120,7 @@ class EmergencyAssist:
         self.cool = {}            # 오래 붙잡았던 신호등 → 다시 우선신호를 줄 수 있는 시각 (교차 방향도 한 번은 초록)
         self.tl = None            # 신호등 시간표 (처음 step 때 읽음)
         self.stats = {"make_way": 0, "into_bus_lane": 0, "priority_signal": 0, "ped_stop": 0, "entry_hold": 0,
-                      "box_hold": 0}
+                      "box_hold": 0, "bus_merge": 0}
         self._load_crossings(net_file or _default_net())
 
     # ── 네트워크에서 횡단보도 읽기 ──
@@ -119,6 +128,7 @@ class EmergencyAssist:
         root = ET.parse(net_file).getroot()
         self.cross = {}                       # 횡단보도 → 정보
         self.cross_at = {}                    # 노드 → [횡단보도]
+        self.feeds = {}                       # 차로 → 교차로를 지나 그 차로로 들어오는 앞 도로의 차로들
         self.via_src = {}                     # 교차로 안 차로 → (들어오는 차로, 신호등, 신호 번호)
         to_node = {}
         for e in root.iter("edge"):
@@ -135,6 +145,8 @@ class EmergencyAssist:
                 to_node[e.get("id")] = e.get("to")
         for c in root.iter("connection"):
             f, t = c.get("from", ""), c.get("to", "")
+            if f and t and not f.startswith(":") and not t.startswith(":"):
+                self.feeds.setdefault(f"{t}_{c.get('toLane')}", set()).add(f"{f}_{c.get('fromLane')}")
             if c.get("via"):
                 tl = c.get("tl")
                 self.via_src[c.get("via")] = (f"{f}_{c.get('fromLane')}", tl, int(c.get("linkIndex")) if tl is not None else None)
@@ -156,14 +168,22 @@ class EmergencyAssist:
         if self.box_guard:
             self._box_guard()
         for v in traci.simulation.getDepartedIDList():
-            if traci.vehicle.getTypeID(v) in self.siren_types:
+            kind = traci.vehicle.getTypeID(v)
+            if kind in self.siren_types:
                 self.evs.add(v)
+            elif kind == "bus":
+                self.buses.add(v)
         for v in traci.simulation.getArrivedIDList():
+            self.buses.discard(v)
+            self.bus_asked.pop(v, None)
+            self.bus_since.pop(v, None)
             self.evs.discard(v)
             self.capped.discard(v)
             self.hold.pop(v, None)
             self.why.pop(v, None)
             self.yielding.pop(v, None)
+        if self.bus_wait > 0:
+            self._bus_merge(t)
         if not self.evs and not self.yielding and not self.pre and not self.held:
             return
         live = set(traci.vehicle.getIDList())
@@ -285,6 +305,71 @@ class EmergencyAssist:
         for f, g in traci.vehicle.getNeighbors(vid, side):
             if g < 25.0 and f not in self.evs and not f.startswith(self.skip):
                 traci.vehicle.slowDown(f, 0.0, 2.0)
+
+    def _bus_merge(self, t):
+        """버스 끼워 주기: 차로가 20 m 안에서 끝나는데 옆 차로로 못 옮기고 bus_wait 초 넘게 서 있는 버스가 있으면,
+        옮겨 갈 차로에서 버스 뒤로 따라오는 차(25 m 안)와, 앞 교차로를 지나 그 차로로 들어올 맨 앞 차를 세우고
+        버스에 차로변경을 시킨다 (버스 옆에 이미 와 있는 차는 지나가게 둔다). 차로변경 자체는 SUMO 가 안전할 때만
+        실행한다. 한 버스에 40초 넘게 해 줬으면 20초 쉰다. 정류장에 선 버스, 교차로 안의 버스는 해당 없음."""
+        if int(t) % 10 == 0 and t == int(t):
+            self.buses &= set(traci.vehicle.getIDList())
+        for b in sorted(self.buses):
+            if t - self.bus_asked.get(b, -1e9) < 1.0:
+                continue
+            try:
+                if (traci.vehicle.getSpeed(b) > 0.1 or traci.vehicle.getWaitingTime(b) < self.bus_wait
+                        or traci.vehicle.isStopped(b)):
+                    self.bus_since.pop(b, None)
+                    continue
+                ln = traci.vehicle.getLaneID(b)
+                if not ln or ln.startswith(":"):
+                    continue
+                want, reach = 0, INF
+                for bl in traci.vehicle.getBestLanes(b):
+                    if bl[0] == ln:
+                        want, reach = (bl[3] > 0) - (bl[3] < 0), bl[1]
+                if not want or reach - traci.vehicle.getLanePosition(b) > 20.0:
+                    continue                              # 옮길 필요가 없거나 아직 차로가 한참 남음
+                edge, idx = traci.vehicle.getRoadID(b), traci.vehicle.getLaneIndex(b)
+                if not 0 <= idx + want < traci.edge.getLaneNumber(edge):
+                    continue
+                since = self.bus_since.setdefault(b, t)
+                if t - since > 40.0:
+                    if t - since > 60.0:
+                        self.bus_since[b] = t
+                    continue                              # 너무 오래 세워 둠 → 잠시 쉼
+                for f, g in traci.vehicle.getNeighbors(b, 0 if want > 0 else 1):
+                    # 버스 꽁무니보다 뒤에 있는 차만 세운다 (옆에 나란히 있는 차는 먼저 지나가야 틈이 생김)
+                    if 0.5 <= g < 25.0 and f not in self.evs and not f.startswith(self.skip):
+                        traci.vehicle.slowDown(f, 0.0, 2.0)
+                for src in self.feeds.get(f"{edge}_{idx + want}", ()):
+                    ids = traci.lane.getLastStepVehicleIDs(src)
+                    if not ids:
+                        continue
+                    f = ids[-1]                           # 앞 도로에서 그 차로로 들어올 맨 앞 차
+                    if f == b or f in self.evs or f in self.buses or f.startswith(self.skip):
+                        continue
+                    vf = traci.vehicle.getSpeed(f)
+                    room = self._length(src) - traci.vehicle.getLanePosition(f) - 1.0
+                    if f in self.bus_hold or room >= vf * self.dt + vf * vf / (2 * 3.0):
+                        self.bus_hold[f] = (src, t + 1.6)  # 정지선 앞에 편하게 설 수 있는 차만
+                traci.vehicle.changeLane(b, idx + want, 3.0)
+            except traci.TraCIException:
+                self.buses.discard(b)
+                continue
+            if b not in self.bus_asked:
+                self.stats["bus_merge"] += 1
+            self.bus_asked[b] = t
+        for f in list(self.bus_hold):                     # 세운 차: 정지선 1 m 앞에 서 있게 하고, 요청이 끊기면 풀어 준다
+            src, until = self.bus_hold[f]
+            try:
+                if t > until or traci.vehicle.getLaneID(f) != src:
+                    traci.vehicle.setSpeed(f, -1)
+                    del self.bus_hold[f]
+                else:
+                    traci.vehicle.setSpeed(f, self._stop_speed(self._length(src) - traci.vehicle.getLanePosition(f) - 1.0))
+            except traci.TraCIException:
+                del self.bus_hold[f]
 
     def _hold_stoppers(self, ev, t, chain):
         """긴급차 경로 앞 60 m 안, 옆 차로 정류장에 서 있는 버스(등)는 긴급차가 지나갈 때까지 출발하지 않음
@@ -546,6 +631,38 @@ class EmergencyAssist:
                 return "들어올 차"
         return None
 
+    def _blocked_ahead(self, ev, pos, hx, hy, v):
+        """교차로 안을 지나는 긴급차 앞길(멈추는 데 필요한 거리 + 6 m, 좌우는 두 차 폭의 절반 + 0.8 m)에 가로지르는
+        차로의 차 몸통이 걸쳐 있으면 거기까지의 거리, 없으면 None. SUMO 는 교차로 안에서 기어가다 멈춘 차를
+        '지나간 차'로 보고 긴급차를 출발시켜 들이받는 일이 있어서 차 위치를 직접 본다."""
+        via = traci.vehicle.getLaneID(ev)
+        J = self.junc.get(via)
+        if J is None:
+            J = self.junc[via] = self._conflicts(via)
+        look = v * v / (2 * self.ped_brake) + 6.0
+        half = traci.vehicle.getWidth(ev) / 2
+        best = None
+        for f, tail in J["inside"]:
+            ids = list(traci.lane.getLastStepVehicleIDs(f))
+            if tail is not None:
+                ids += list(traci.lane.getLastStepVehicleIDs(tail))[:1]
+            for x in ids:
+                if x == ev or traci.vehicle.getSpeed(x) > 3.0:
+                    continue                              # 움직이는 차는 SUMO 가 본다
+                px, py = traci.vehicle.getPosition(x)
+                a = math.radians(traci.vehicle.getAngle(x))
+                ux, uy = math.sin(a), math.cos(a)
+                side_max = half + traci.vehicle.getWidth(x) / 2 + 0.8
+                k, length = 0.0, traci.vehicle.getLength(x)
+                while k <= length:                        # 차 몸통을 앞머리부터 1 m 간격으로
+                    qx, qy = px - ux * k, py - uy * k
+                    ahead = (qx - pos[0]) * hx + (qy - pos[1]) * hy
+                    side = (qx - pos[0]) * hy - (qy - pos[1]) * hx
+                    if 0.0 <= ahead <= look and abs(side) <= side_max and (best is None or ahead < best):
+                        best = ahead
+                    k += 1.0
+        return best
+
     def _guard(self, ev, t):
         """긴급차 속도 상한: 정지선·횡단보도 앞에서 설 수 있게 줄이고, 조건이 풀리면 원래대로."""
         pos = traci.vehicle.getPosition(ev)
@@ -609,6 +726,10 @@ class EmergencyAssist:
                     cap, why = min(cap, self._stop_speed(edge - 2.0)), "보행자"
                 elif self._ped_in_path(cid, pos, hx, hy):
                     cap, why = 0.0, "보행자"               # 이미 횡단보도에 걸쳐 있음: 바로 앞에 사람이 있을 때만 선다
+        if inside:                                        # 교차로 안: 내 길에 걸쳐 서 있는 차 앞에서 선다
+            room = self._blocked_ahead(ev, pos, hx, hy, v)
+            if room is not None:
+                cap, why = min(cap, self._stop_speed(room - 2.0)), "교차로 안에 차"
         if hold is None:
             self.hold.pop(ev, None)
         else:
